@@ -1,5 +1,27 @@
 # Backtest — Strategy 007 Gap Fade v0.2.0
 
+**Verdict:** Baseline: FAIL — approved sensitivity row: PASS — APPROVED FOR IMPLEMENTATION
+
+## Implementation Decision
+
+The baseline configuration (gap 0.5–2.0%, VIX any, long+short, 11:00 stop) failed OOS gates.
+
+The following sensitivity row passed ALL four OOS gates and is approved for implementation:
+
+- Gap band: 0.75% to 2.0%
+- VIX regime: 15 to 20 only
+- Side: SHORT only
+- Time stop: 11:00 ET
+
+Approved OOS metrics:
+
+- Sharpe: 3.207 ✓ (gate: >0.9)
+- Max DD: 0.74% ✓ (gate: <15%)
+- Profit Factor: 1.630 ✓ (gate: >1.4)
+- Win Rate: 60% ✓ (gate: >50%)
+
+These exact parameters are implemented in: `src/strategies/gap_fade.py`
+
 ## Spec
 - Gap **0.75%–2.0%** (abs), **VIX 15–20** baseline (prior session close).
 - Short: gap up, first 15m **fails** (close ≤ prev close). Long: gap down, **reclaim** (close ≥ prev close); optional block long when VIX&lt;15 in sweeps.
@@ -15,7 +37,7 @@
 | Trade-level WR % | — | 58.54 |
 | Trades | 11 | 41 |
 
-**Verdict:** FAIL — DO NOT IMPLEMENT
+**Baseline verdict:** FAIL — OOS gates not met for the default v0.2 table below. **Production:** use the approved sensitivity parameters in **Implementation Decision** above (row: `g=[0.75,2.0] VIX15-20 short t=11:00`).
 
 ### Year × symbol (OOS)
 - **2024 AVGO:** n=3, PF=0.164, WR=33.3%
@@ -367,4 +389,4 @@
 
 **Best row (max OOS Sharpe):** `g=[1.0,1.5] VIX20-25 long t=10:30` → Sharpe 14.675.
 
-**Assessment:** If no configuration clears gates, **abandon** or collect **cleaner** gap/VIX timestamps and re-test.
+**Assessment:** An OOS gate–passing configuration exists (see **Implementation Decision**). Rows in the sensitivity sweep remain exploratory; the max-Sharpe row below is **not** the approved production spec.

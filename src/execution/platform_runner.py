@@ -37,6 +37,7 @@ from sqlalchemy import select
 from brokers.exceptions import BrokerAuthError, BrokerError, BrokerNetworkError
 
 from execution.account_router import AccountRouter
+from execution.intraday_manager import IntradayPositionManager
 from execution.logger import ExecutionLogger
 from execution.order_tracker import OrderTracker
 from execution.router import OrderRouter
@@ -50,9 +51,26 @@ from execution.runner import (
 from execution.tracker import PositionTracker
 from strategies.registry import StrategyAccessDenied, StrategyNotFound, load_strategy_for_tenant, register
 
-PLATFORM_STRATEGY_IDS: tuple[str, ...] = ("strategy_002", "strategy_004", "strategy_006")
+PLATFORM_STRATEGY_IDS: tuple[str, ...] = ("strategy_004", "strategy_007")
+
+# Paused in DB / docs — not loaded by ``_load_strategies`` (see startup banner).
+PLATFORM_PAUSED_STRATEGY_IDS: tuple[str, ...] = ("strategy_002", "strategy_006")
 
 _NY = ZoneInfo("America/New_York")
+
+
+def _broker_symbol_matches_handler_symbol_list(broker_sym: str, handler_symbols: list[Any]) -> bool:
+    """Match broker position symbol (e.g. ``MESM26``, ``AVGO``) to strategy universe (``@MES``, ``AVGO``)."""
+    b = broker_sym.strip().upper()
+    roots = sorted(
+        (str(x).strip().upper().lstrip("@") for x in handler_symbols),
+        key=len,
+        reverse=True,
+    )
+    for su in roots:
+        if b == su or b.startswith(su):
+            return True
+    return False
 
 
 def _dedupe_account_ids(*ids: str | None) -> list[str]:
@@ -137,6 +155,31 @@ class LoadedStrategy:
     interval: str
 
 
+def _interval_display(interval: str) -> str:
+    u = (interval or "").strip().upper()
+    if u == "1D":
+        return "daily"
+    return (interval or "1m").strip().lower()
+
+
+def _check_symbol_conflicts(strategies: list[LoadedStrategy]) -> None:
+    """Raise if two loaded strategies share the same symbol at the same bar interval."""
+    seen: dict[tuple[str, str], str] = {}
+    for strat in strategies:
+        interval = str(strat.interval or "1m").strip()
+        interval_key = interval.upper()
+        for symbol in strat.symbols:
+            sym_u = str(symbol).strip().upper().lstrip("@")
+            key = (sym_u, interval_key)
+            if key in seen:
+                raise ValueError(
+                    f"Symbol conflict: {sym_u} ({interval}) used by both "
+                    f"{seen[key]} and {strat.strategy_id}"
+                )
+            seen[key] = strat.strategy_id
+    print("[PLATFORM] No symbol conflicts — all instruments unique per interval")
+
+
 def _log_stream_connections(loaded: list[LoadedStrategy]) -> None:
     stream_specs = [s for s in loaded if (s.interval or "").strip().upper() != "1D"]
     daily_specs = [s for s in loaded if (s.interval or "").strip().upper() == "1D"]
@@ -216,6 +259,9 @@ class TradingPlatform:
                 continue
 
             handler = cls()
+            set_ctx = getattr(handler, "set_broker_context", None)
+            if callable(set_ctx) and self.adapter is not None:
+                set_ctx(self.adapter, self.tenant_id)
             symbols = list(getattr(handler, "symbols", []) or [])
             interval = str(getattr(handler, "interval", "1m") or "1m")
             out.append(
@@ -229,9 +275,35 @@ class TradingPlatform:
             )
         return out
 
+    def _print_platform_strategy_status(self) -> None:
+        """Log active (loaded) vs paused platform strategies."""
+        loaded = self._strategies
+        print(f"[PLATFORM] Active strategies: {len(loaded)}")
+        for spec in loaded:
+            syms = " ".join(str(s).strip().upper() for s in spec.symbols)
+            iv = _interval_display(spec.interval)
+            print(f"  {spec.strategy_id}: {syms} ({iv})")
+        paused = list(PLATFORM_PAUSED_STRATEGY_IDS)
+        factory = get_session_factory()
+        with factory() as session:
+            rows = list(
+                session.execute(
+                    select(DbStrategy.id, DbStrategy.status).where(
+                        DbStrategy.owner_tenant_id == self.tenant_id,
+                        DbStrategy.id.in_(paused),
+                    ).order_by(DbStrategy.id)
+                ).all()
+            )
+        status_by_id = {r.id: r.status for r in rows}
+        print(f"[PLATFORM] Paused strategies: {len(paused)}")
+        for pid in paused:
+            st = status_by_id.get(pid, "paused")
+            print(f"  {pid}: {st}")
+
     def _initial_cash_account_for_strategy(self, spec: LoadedStrategy) -> str:
         """Broker account id used for risk / fills (must match AccountRouter + order stream)."""
-        inst = InstrumentType.FUTURES if spec.strategy_id == "strategy_006" else InstrumentType.EQUITY
+        sym0 = str(spec.symbols[0]).strip().upper() if spec.symbols else ""
+        inst = InstrumentType.FUTURES if sym0.startswith("@") else InstrumentType.EQUITY
         o = Order(
             symbol=spec.symbols[0] if spec.symbols else "SPY",
             instrument_type=inst,
@@ -242,6 +314,41 @@ class TradingPlatform:
             strategy_id=spec.strategy_id,
         )
         return AccountRouter().resolve(o, tenant_id=self.tenant_id)
+
+    async def _eod_flatten_task(self) -> None:
+        """Safety net — flatten intraday-tagged symbols via broker at 15:50 ET Mon–Fri."""
+        ET = ZoneInfo("America/New_York")
+        while True:
+            try:
+                now = datetime.now(ET)
+                target = now.replace(hour=15, minute=50, second=0, microsecond=0)
+                if now >= target:
+                    target = target + timedelta(days=1)
+                while target.weekday() >= 5:
+                    target = target + timedelta(days=1)
+                wait_seconds = max(0.0, (target - now).total_seconds())
+                print(f"[EOD_FLATTEN] Next safety flatten: {target.strftime('%Y-%m-%d %H:%M ET')}")
+                await asyncio.sleep(wait_seconds)
+                print("[EOD_FLATTEN] Safety flatten triggered @ 15:50 ET")
+                print("[EOD_FLATTEN] Running safety flatten for all intraday strategies")
+                if self.adapter is None:
+                    continue
+                settings = get_settings()
+                acct = (settings.ts_equity_account_id or "").strip() or (settings.ts_account_id or "").strip()
+                if not acct:
+                    print("[EOD_FLATTEN] No equity account id configured — skip")
+                    continue
+                manager = IntradayPositionManager(self.trading_mode, account_id=acct)
+                await manager.enforce_eod_close(
+                    self.tenant_id,
+                    self.adapter,
+                    close_time="15:50",
+                    account_id=acct,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                print(f"[EOD_FLATTEN] Error: {e}")
 
     async def _refresh_loop(self) -> None:
         assert self.adapter is not None and self._store is not None
@@ -266,7 +373,11 @@ class TradingPlatform:
 
     async def _handle_bar(self, spec: LoadedStrategy, bar: Bar) -> None:
         assert self._router is not None
-        raw = spec.handler.on_bar(bar.symbol, _bar_to_dict(bar))
+        bar_d = _bar_to_dict(bar)
+        pre = getattr(spec.handler, "prefetch_session_data_async", None)
+        if pre is not None:
+            await pre(bar_d)
+        raw = spec.handler.on_bar(bar.symbol, bar_d)
         for sig in _dict_to_signals(
             raw,
             tenant_id=self.tenant_id,
@@ -277,6 +388,9 @@ class TradingPlatform:
                 await self._router.route(sig)
             except BrokerError as e:
                 print(f"[ORDER_ERR] Order failed: {e} — stream continues")
+        post_bar = getattr(spec.handler, "post_bar_async", None)
+        if post_bar is not None:
+            await post_bar(bar.symbol, bar_d)
 
     async def _stream_symbol(self, spec: LoadedStrategy, symbol: str) -> None:
         assert self.adapter is not None
@@ -575,17 +689,17 @@ class TradingPlatform:
                         continue
 
                     side = "short" if qty < 0 else "long"
-                    strat_sym = "@" + symbol
                     for strategy in self._strategies:
                         h = getattr(strategy, "handler", None)
                         if h is None or not hasattr(h, "update_position"):
                             continue
-                        if strat_sym not in (getattr(h, "symbols", []) or []):
+                        syms = getattr(h, "symbols", []) or []
+                        if not _broker_symbol_matches_handler_symbol_list(symbol, syms):
                             continue
                         try:
-                            h.update_position(strat_sym, side)
+                            h.update_position(symbol, side)
                             print(
-                                f"[STARTUP] Restored position: {strat_sym} "
+                                f"[STARTUP] Restored position: {symbol} "
                                 f"{'SHORT' if qty < 0 else 'LONG'} qty={abs(qty)} avg={avg_cost}"
                             )
                         except Exception:
@@ -605,6 +719,9 @@ class TradingPlatform:
             print("[PLATFORM] No strategies loaded (check strategies table and code_ref).")
             raise SystemExit(1)
 
+        _check_symbol_conflicts(self._strategies)
+        self._print_platform_strategy_status()
+
         await self._reconstruct_positions_from_snapshot()
         _log_stream_connections(self._strategies)
 
@@ -623,6 +740,7 @@ class TradingPlatform:
         print(f"[PLATFORM] Running {len(self._strategies)} strategies concurrently")
         strategy_tasks = [asyncio.create_task(self._strategy_supervisor(s)) for s in self._strategies]
         gather_list: list[asyncio.Task[Any]] = list(strategy_tasks)
+        gather_list.append(asyncio.create_task(self._eod_flatten_task()))
         if self.order_tracker is not None:
             settings = get_settings()
             stream_accounts = _dedupe_account_ids(

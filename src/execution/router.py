@@ -118,6 +118,16 @@ class OrderRouter:
         if signal.tenant_id != self._tenant_id or signal.trading_mode != self._trading_mode:
             raise ValueError("tenant mismatch on signal")
 
+    async def _get_strategy_daily_pnl(self, strategy_id: str) -> float:
+        """Today's realized cash-flow proxy from fills (ET day), excluding snapshot replays."""
+        return await asyncio.to_thread(
+            _sync_strategy_daily_pnl,
+            self._tenant_id,
+            self._trading_mode,
+            strategy_id,
+            clock=self._risk_pnl_clock,
+        )
+
     async def evaluate_risk(self, signal: Signal, *, account_id: str) -> RiskDecision:
         self._guard(signal)
         acct = account_id.strip()
@@ -141,31 +151,19 @@ class OrderRouter:
             strat_limit is not None
             and signal.signal_type in (SignalType.ENTER, SignalType.REBALANCE, SignalType.TARGET_WEIGHTS)
         ):
-            pnl = await asyncio.to_thread(
-                _sync_strategy_daily_pnl,
-                self._tenant_id,
-                self._trading_mode,
-                signal.strategy_id,
-                clock=self._risk_pnl_clock,
-            )
+            pnl = await self._get_strategy_daily_pnl(signal.strategy_id)
             if pnl <= strat_limit:
+                print(f"[RISK] {signal.strategy_id} daily loss limit hit")
                 print(
-                    f"[RISK] {signal.strategy_id} daily loss limit hit — "
-                    f"realized ${pnl:.0f} <= limit ${strat_limit:.0f} — no new entries until tomorrow"
+                    f"[RISK] realized ${pnl:.0f} <= limit ${strat_limit:.0f} "
+                    f"— no new entries until tomorrow"
                 )
                 return RiskDecision(allowed=False, reason="strategy_daily_loss_limit")
 
-        if signal.signal_type in (SignalType.ENTER, SignalType.REBALANCE, SignalType.TARGET_WEIGHTS):
-            ok = self._tracker.vix_guard_allows_entries(
-                tenant_id=self._tenant_id,
-                trading_mode=self._trading_mode,
-                account_id=acct,
-                strategy_id=signal.strategy_id,
-                off_gt=self._policy.vix_off_gt,
-                on_le=self._policy.vix_on_le,
-            )
-            if not ok:
-                return RiskDecision(allowed=False, reason="vix_circuit_breaker")
+        # NOTE: VIX gating is enforced at strategy level (gap_fade.py, swing_pullback.py).
+        # Router-level vix_guard_allows_entries() is not called here — PositionTracker.update_vix()
+        # is not wired from live market data in production. Do not re-enable without wiring
+        # update_vix() to a live VIX source.
 
         # Max positions / weight is enforced against current state; reduces are allowed.
         pos_count = int(m["position_count"] or 0)
