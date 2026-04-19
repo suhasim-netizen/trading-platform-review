@@ -7,16 +7,76 @@ ADR 0002: All risk limits enforced before calling BrokerAdapter.place_order.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from decimal import Decimal
+from typing import Any
 
 from brokers.base import BrokerAdapter
 from brokers.models import InstrumentType, Order, OrderReceipt, OrderSide, OrderType, Quote, TimeInForce
+from sqlalchemy import and_, case, func, select
+from zoneinfo import ZoneInfo
+
+from db.models import ExecutionFill, ExecutionOrder as DbExecutionOrder
+from db.session import get_session_factory
 
 from .account_router import AccountRouter
 from .logger import ExecutionLogger
 from .models import RiskDecision, Signal, SignalType
 from .tracker import PositionTracker
+
+# Approved per-strategy realized P&L caps (USD, negative = loss). None → no extra cap.
+STRATEGY_DAILY_LOSS_LIMITS: dict[str, float] = {
+    "strategy_004": -1500.0,
+    "strategy_007": -1000.0,
+}
+
+
+def _et_day_start_utc(clock: datetime | None = None) -> datetime:
+    """Midnight America/New_York for the calendar day of ``clock`` (or now), as UTC."""
+    et = ZoneInfo("America/New_York")
+    ref = datetime.now(et) if clock is None else clock.astimezone(et)
+    d = ref.date()
+    return datetime.combine(d, datetime.min.time(), tzinfo=et).astimezone(UTC)
+
+
+def _sync_strategy_daily_pnl(
+    tenant_id: str,
+    trading_mode: str,
+    strategy_id: str,
+    *,
+    clock: datetime | None = None,
+) -> float:
+    """Sum signed fill notionals for today (ET day): SELL +px×qty, BUY -px×qty (cash-flow proxy)."""
+    start = _et_day_start_utc(clock)
+    sign_expr = case(
+        (DbExecutionOrder.side == "sell", ExecutionFill.fill_price * ExecutionFill.fill_qty),
+        else_=-ExecutionFill.fill_price * ExecutionFill.fill_qty,
+    )
+    stmt = (
+        select(func.coalesce(func.sum(sign_expr), 0))
+        .select_from(ExecutionFill)
+        .join(
+            DbExecutionOrder,
+            and_(
+                DbExecutionOrder.order_id == ExecutionFill.order_id,
+                DbExecutionOrder.tenant_id == ExecutionFill.tenant_id,
+                DbExecutionOrder.trading_mode == ExecutionFill.trading_mode,
+            ),
+        )
+        .where(
+            ExecutionFill.tenant_id == tenant_id,
+            ExecutionFill.trading_mode == trading_mode,
+            DbExecutionOrder.strategy_id == strategy_id,
+            ExecutionFill.is_snapshot.is_(False),
+            ExecutionFill.filled_at >= start,
+        )
+    )
+    factory = get_session_factory()
+    with factory() as session:
+        row = session.execute(stmt).scalar_one()
+    return float(row or 0)
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,6 +101,7 @@ class OrderRouter:
         logger: ExecutionLogger,
         policy: RiskPolicy | None = None,
         account_router: AccountRouter | None = None,
+        risk_pnl_clock: datetime | None = None,
     ) -> None:
         if not tenant_id or not trading_mode:
             raise ValueError("tenant_id and trading_mode are required")
@@ -51,12 +112,13 @@ class OrderRouter:
         self._log = logger
         self._policy = policy or RiskPolicy()
         self._acct_router = account_router or AccountRouter()
+        self._risk_pnl_clock = risk_pnl_clock
 
     def _guard(self, signal: Signal) -> None:
         if signal.tenant_id != self._tenant_id or signal.trading_mode != self._trading_mode:
             raise ValueError("tenant mismatch on signal")
 
-    def evaluate_risk(self, signal: Signal, *, account_id: str) -> RiskDecision:
+    async def evaluate_risk(self, signal: Signal, *, account_id: str) -> RiskDecision:
         self._guard(signal)
         acct = account_id.strip()
         if not acct:
@@ -73,6 +135,25 @@ class OrderRouter:
         daily = m["daily_pnl_pct"]
         if isinstance(daily, Decimal) and daily <= self._policy.daily_loss_limit:
             return RiskDecision(allowed=False, reason="daily_loss_limit")
+
+        strat_limit = STRATEGY_DAILY_LOSS_LIMITS.get(signal.strategy_id)
+        if (
+            strat_limit is not None
+            and signal.signal_type in (SignalType.ENTER, SignalType.REBALANCE, SignalType.TARGET_WEIGHTS)
+        ):
+            pnl = await asyncio.to_thread(
+                _sync_strategy_daily_pnl,
+                self._tenant_id,
+                self._trading_mode,
+                signal.strategy_id,
+                clock=self._risk_pnl_clock,
+            )
+            if pnl <= strat_limit:
+                print(
+                    f"[RISK] {signal.strategy_id} daily loss limit hit — "
+                    f"realized ${pnl:.0f} <= limit ${strat_limit:.0f} — no new entries until tomorrow"
+                )
+                return RiskDecision(allowed=False, reason="strategy_daily_loss_limit")
 
         if signal.signal_type in (SignalType.ENTER, SignalType.REBALANCE, SignalType.TARGET_WEIGHTS):
             ok = self._tracker.vix_guard_allows_entries(
@@ -153,7 +234,7 @@ class OrderRouter:
         order = _signal_to_order(signal)
         account_id = self._acct_router.resolve(order, tenant_id=self._tenant_id)
 
-        decision = self.evaluate_risk(signal, account_id=account_id)
+        decision = await self.evaluate_risk(signal, account_id=account_id)
         if not decision.allowed:
             # Log blocked actions as orders with a synthetic status.
             return None
@@ -197,6 +278,9 @@ def _signal_to_order(signal: Signal) -> Order:
             qty = Decimal("1")
     if qty == 0:
         qty = Decimal("1")
+    meta: dict[str, Any] = {"generated_at": signal.generated_at.isoformat()}
+    if isinstance(params.get("bracket"), dict):
+        meta["bracket"] = params["bracket"]
     return Order(
         symbol=signal.symbol,
         instrument_type=inst,
@@ -205,7 +289,7 @@ def _signal_to_order(signal: Signal) -> Order:
         order_type=OrderType.MARKET,
         time_in_force=TimeInForce.DAY,
         strategy_id=signal.strategy_id,
-        metadata={"generated_at": signal.generated_at.isoformat()},
+        metadata=meta,
     )
 
 
