@@ -269,6 +269,10 @@ class TradeStationAdapter(BrokerAdapter):
         return tok
 
     async def refresh_token(self, token: AuthToken) -> AuthToken:
+        """Persist new OAuth tokens from ``refresh_token`` grant (with retries).
+
+        Exponential backoff: 2s, 4s, 8s between attempts (including after the final failure).
+        """
         if self._store is None or self._audit is None:
             raise BrokerValidationError("token store and audit logger are required for refresh_token")
         tenant_id = token.tenant_id
@@ -309,12 +313,10 @@ class TradeStationAdapter(BrokerAdapter):
                 return refreshed
             except BaseException as e:
                 last_err = e
-                if attempt < max_attempts:
-                    wait = 2**attempt
-                    print(f"[REFRESH] Attempt {attempt} failed: {e} — retrying in {wait}s")
-                    await asyncio.sleep(float(wait))
-                else:
-                    print(f"[REFRESH] All {max_attempts} attempts failed: {e}")
+                wait = 2**attempt
+                print(f"[REFRESH] Attempt {attempt} failed — retrying in {wait}s")
+                await asyncio.sleep(float(wait))
+        print(f"[REFRESH] All {max_attempts} attempts failed — giving up")
         assert last_err is not None
         raise last_err
 

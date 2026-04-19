@@ -26,6 +26,16 @@
 | C — Extended hold only | 38 | 39.5 | 1.29 | 10.11 | 0.483 |
 | D — VIX + ATR + 20d | 16 | 68.8 | 3.92 | 7.12 | 1.623 |
 
+## Long / Short Performance Split (Variant D OOS)
+
+| Side | Win Rate | Profit Factor | Note |
+| --- | --- | --- | --- |
+| Long | 62.5% | 2.49 | Active |
+| Short | ~0% | &lt;1.0 | DISABLED |
+| Combined | 68.8% | 3.92 | Long only |
+
+Short side disabled via `ENABLE_SHORTS = False` in `src/strategies/swing_pullback.py` line 33. All live signals are long-only.
+
 ### Acceptance rule (from spec)
 Count **hits** among:
 - **WR** &gt; **52%**
