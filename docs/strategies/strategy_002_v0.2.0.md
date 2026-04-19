@@ -6,7 +6,7 @@ owner_kind: platform
 owner_tenant_id: director
 code_ref: src.strategies.momentum
 asset_class: equity
-status: paper
+status: paused
 bar_interval: 5m
 eod_close: true
 ---

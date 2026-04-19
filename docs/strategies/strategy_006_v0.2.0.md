@@ -6,7 +6,7 @@ owner_kind: platform
 owner_tenant_id: director
 code_ref: src.strategies.futures_intraday
 asset_class: futures
-status: paper
+status: paused
 bar_interval: 1m
 eod_close: true
 ---
